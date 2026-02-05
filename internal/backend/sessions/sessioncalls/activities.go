@@ -2,8 +2,10 @@ package sessioncalls
 
 import (
 	"context"
+	"errors"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 
 	"go.autokitteh.dev/autokitteh/internal/backend/temporalclient"
 	"go.autokitteh.dev/autokitteh/sdk/sdktypes"
@@ -57,13 +59,18 @@ func (cs *calls) sessionCallActivity(ctx context.Context, params *CallActivityIn
 		return &CallActivityOutputs{Retry: true}, nil
 	}
 
-	if !params.CallSpec.Function().GetFunction().HasFlag(sdktypes.DisableAutoHeartbeat) && cs.config.ActivityHeartbeatInterval > 0 {
-		_, done := BeginHeartbeat(ctx, cs.config.ActivityHeartbeatInterval)
-		defer done()
-	}
-
 	result, err := cs.executeCall(ctx, params.CallSpec, executors)
 	if err != nil {
+		if errors.Is(err, errStuckRuntime) {
+			sl.Warnf("stuck runtime")
+
+			return nil, temporal.NewNonRetryableApplicationError(
+				"stuck runtime detected",
+				stuckRuntimeErrorType,
+				err,
+			)
+		}
+
 		return nil, temporalclient.TranslateError(err, "execute call for %v", params.SessionID)
 	}
 

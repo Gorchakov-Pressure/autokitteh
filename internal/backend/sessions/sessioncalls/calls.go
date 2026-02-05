@@ -28,8 +28,14 @@ type CallParams struct {
 	Executors *sdkexecutor.Executors // needed for session specific calls (global modules, script functions).
 }
 
+var errStuckRuntime = errors.New("runtime stuck during call execution")
+
+const stuckRuntimeErrorType = "stuck_runtime"
+
 type Calls interface {
 	StartWorkers(context.Context) error
+
+	// returns RuntimeStuckError if the runtime got stuck during the call (require workflow replay).
 	Call(ctx workflow.Context, params *CallParams) (sdktypes.SessionCallAttemptResult, error)
 }
 
@@ -147,6 +153,7 @@ func (cs *calls) Call(wctx workflow.Context, params *CallParams) (sdktypes.Sessi
 			}()
 		}
 
+	retry_loop:
 		for retry := true; retry; {
 			aopts := cs.config.activityConfig().
 				WithUnlimitedTimeToClose(). // Do not limit activities execution duration.
@@ -174,6 +181,8 @@ func (cs *calls) Call(wctx workflow.Context, params *CallParams) (sdktypes.Sessi
 
 			var ret CallActivityOutputs
 
+			isReplaying := workflow.IsReplaying(wctx)
+
 			future := workflow.ExecuteActivity(
 				actx,
 				CallActivityName,
@@ -185,12 +194,31 @@ func (cs *calls) Call(wctx workflow.Context, params *CallParams) (sdktypes.Sessi
 			)
 			if err := future.Get(wctx, &ret); err != nil {
 				var terr *temporal.TimeoutError
-				if ok := errors.As(err, &terr); ok && terr.TimeoutType() == enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START {
-					// An activity that was scheduled on a unique worker (ie the workflow worker) did not get to be started.
-					// This might happen in cases of scale-down events or a recovery from a crashed worker.
-					// In this case we just reshecule it again.
-					l.Warn("call activity schedule to start timeout, retrying")
-					continue
+				if ok := errors.As(err, &terr); ok {
+					switch terr.TimeoutType() {
+					case enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START:
+						// An activity that was scheduled on a unique worker (ie the workflow worker) did not get to be started.
+						// This might happen in cases of scale-down events or a recovery from a crashed worker.
+						// In this case we just reshecule it again.
+						l.Warn("call activity schedule to start timeout, retrying")
+						continue retry_loop
+					case enumspb.TIMEOUT_TYPE_HEARTBEAT:
+						// panic forces workflow to retry - we need it since the runtime is stuck
+						// and need restarting.
+						l.Panic("stuck runtime detected during call activity")
+					}
+				}
+
+				var aerr *temporal.ApplicationError
+				if ok := errors.As(err, &aerr); ok && aerr.Type() == stuckRuntimeErrorType {
+					if isReplaying {
+						l.Debug("replaying, forcing retry due to stuck runtime")
+						continue retry_loop
+					} else {
+						// panic forces workflow to retry - we need it since the runtime is stuck
+						// and need restarting.
+						l.Panic("stuck runtime detected during call activity")
+					}
 				}
 
 				return sdktypes.InvalidSessionCallAttemptResult, fmt.Errorf("call activity error: %w", err)
@@ -201,7 +229,7 @@ func (cs *calls) Call(wctx workflow.Context, params *CallParams) (sdktypes.Sessi
 				// got started. Since in this case the required session executors where not registered, we just
 				// retry the activity and give a chance to the workflow register the session workers.
 				l.Warn("call activity retrying explicitly")
-				continue
+				continue retry_loop
 			}
 
 			result = ret.Result
