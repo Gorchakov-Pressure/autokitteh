@@ -33,7 +33,9 @@ def _timeout_arg_into_ms(timeout: timedelta | int | float) -> int:
     elif isinstance(timeout, timedelta):
         return int(timeout.total_seconds() * 1000)
 
-    raise TypeError(f"timeout {timeout!r} should be a timedelta or number of seconds")
+    raise TypeError(
+        f"timeout {timeout!r} should be a timedelta, number of seconds, or None"
+    )
 
 
 class SysCalls:
